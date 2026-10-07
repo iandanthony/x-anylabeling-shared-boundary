@@ -18,13 +18,85 @@ from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 original_exec = QtWidgets.QApplication.exec
 
 
+def check_existing_priority(widget):
+    """Exercise real completion, JSON saving and Undo without loading a model."""
+    from anylabeling.views.labeling.shape import Shape
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    def shape(label, coordinates):
+        item = Shape(label=label, shape_type="polygon")
+        item.points = [QtCore.QPointF(x, y) for x, y in coordinates]
+        item.close()
+        return item
+
+    def geometry(item):
+        return Polygon([(p.x(), p.y()) for p in item.points])
+
+    original_popup = widget.label_dialog.pop_up
+    widget.label_dialog.pop_up = lambda *a, **k: ("装修垃圾", {}, None, "", False, [])
+    widget._config["display_label_popup"] = True
+    widget._config["auto_use_last_label"] = False
+    try:
+        for mode in ("manual", "auto", "covered", "split", "enclosed"):
+            image_path = Path(test_work.name) / f"{mode}.png"
+            image = QtGui.QImage(20, 20, QtGui.QImage.Format.Format_RGB32)
+            image.fill(QtCore.Qt.GlobalColor.white)
+            assert image.save(str(image_path))
+            widget.load_file(str(image_path))
+            old_coords = ([(4, 0), (6, 0), (6, 10), (4, 10)] if mode == "split"
+                          else [(3, 3), (7, 3), (7, 7), (3, 7)] if mode == "enclosed"
+                          else [(0, 0), (10, 0), (10, 10), (0, 10)])
+            old = shape("工程渣土", old_coords)
+            old.locked = True
+            widget.load_shapes([old])
+            before = list(old.points)
+            coordinates = ([(1, 1), (2, 1), (2, 2), (1, 2)] if mode == "covered"
+                           else [(0, 0), (10, 0), (10, 10), (0, 10)] if mode in ("split", "enclosed")
+                           else [(5, 0), (12, 0), (12, 10), (5, 10)])
+            new = shape("AUTOLABEL_OBJECT" if mode == "auto" else None, coordinates)
+            if mode == "auto":
+                widget.canvas.shapes.append(new)
+                widget.canvas.store_shapes()
+                new.cache_label = "装修垃圾"
+                new.cache_description = ""
+                widget.add_label(new)
+                widget.finish_auto_labeling_object()
+            else:
+                widget.canvas.current = new
+                widget.canvas.finalise()
+            assert old.points == before and old.locked
+            if mode == "covered":
+                assert widget.canvas.shapes == [old]
+            else:
+                result = unary_union([geometry(s) for s in widget.canvas.shapes if s is not old])
+                assert result.area == {"split": 80, "enclosed": 84}.get(mode, 20)
+                assert result.intersection(geometry(old)).area == 0
+                if mode in ("manual", "auto"):
+                    assert result.boundary.intersection(geometry(old).boundary).length == 10
+            output = Path(test_work.name) / f"{mode}.json"
+            assert widget.save_labels(str(output))
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            saved_old = next(s for s in saved["shapes"] if s["label"] == "工程渣土")
+            assert saved_old["points"] == [[p.x(), p.y()] for p in before]
+            assert len(saved["shapes"]) == len(widget.canvas.shapes)
+            assert len(widget.canvas.shapes_backups) == 2
+            widget.undo_shape_edit()
+            assert len(widget.canvas.shapes) == 1
+            restored = widget.canvas.shapes[0]
+            assert restored.label == "工程渣土" and restored.points == before and restored.locked
+            print(f"existing priority: {mode} completion, JSON and Undo passed")
+    finally:
+        widget.label_dialog.pop_up = original_popup
+
+
 def quick_exec(app):
     def check():
         actions = [
             action
             for window in app.topLevelWidgets()
             for action in window.findChildren(QtGui.QAction)
-            if action.text() == "新区域覆盖旧多边形（共边）"
+            if action.text() == "旧区域优先：自动裁剪新多边形（共边）"
         ]
         refine_actions = [
             action
@@ -78,6 +150,8 @@ def quick_exec(app):
         print("Shapes row deduction button:", len(row_buttons))
         print("polygon selection action and button:", len(box_actions), len(box_buttons))
         print("same class deduction button:", len(same_buttons))
+        if actions:
+            check_existing_priority(actions[0].parent())
         if spacing_actions:
             widget = spacing_actions[0].parent()
             controller = widget._settings_controller
@@ -112,7 +186,15 @@ def quick_exec(app):
         if not actions or not actions[0].isChecked() or not refine_actions or not detail_actions or not straighten_actions or not row_buttons or not box_actions or not box_buttons or not same_buttons or not spacing_actions:
             raise RuntimeError("shared boundary menu is not active")
 
-    QtCore.QTimer.singleShot(1000, check)
+    def guarded_check():
+        try:
+            check()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            app.exit(1)
+
+    QtCore.QTimer.singleShot(1000, guarded_check)
     return original_exec()
 
 

@@ -1,8 +1,8 @@
 """Opt-in shared-edge polygons for the local X-AnyLabeling installation.
 
-The most recently completed polygon owns overlapping pixels. Older, unlocked
-polygons of other labels are clipped to it. Shapely performs the boolean
-operation, so the coincident edge uses the new polygon's exact coordinates.
+Existing polygons keep their boundaries. Newly completed polygons of other
+labels are clipped against them. Shapely performs the boolean operation, so
+the coincident edge uses the existing polygons' exact coordinates.
 """
 
 from __future__ import annotations
@@ -583,12 +583,105 @@ def _replace_undo_snapshot(widget) -> None:
         widget.canvas.store_shapes()
 
 
-def _carve_widget(widget, new_shapes, *, force: bool = False) -> bool:
-    """Apply new-polygon priority and keep the canvas and Shapes list in sync."""
+def _clip_new_regions(widget, new_shapes) -> bool:
+    """Subtract the fixed existing regions from new annotations only."""
+    from PyQt6 import QtCore
+
+    candidates = list(new_shapes)
+    undo_history = list(widget.canvas.shapes_backups)
+    candidate_ids = {id(shape) for shape in candidates}
+    references = [
+        shape for shape in widget.canvas.shapes
+        if id(shape) not in candidate_ids
+        and shape.shape_type == "polygon"
+        and shape.label not in SPECIAL_LABELS
+    ]
+    changed = False
+    removed = 0
+    skipped = 0
+    for target in candidates:
+        if (
+            target not in widget.canvas.shapes
+            or target.shape_type != "polygon"
+            or target.label in SPECIAL_LABELS
+        ):
+            continue
+        if target.locked:
+            skipped += 1
+            continue
+        try:
+            geometry = _annotation_geometry(_points(target))
+            if geometry is None:
+                continue
+            cutters = [
+                _annotation_geometry(_points(reference))
+                for reference in references if reference.label != target.label
+            ]
+            cutters = [cutter for cutter in cutters if cutter is not None]
+            if not cutters:
+                continue
+            occupied = unary_union(cutters)
+            if geometry.intersection(occupied).area <= AREA_EPSILON:
+                continue
+            parts = _rings_from_geometry(geometry.difference(occupied))
+        except Exception:
+            LOG.exception("Existing-region clipping failed for %s", target.label)
+            skipped += 1
+            continue
+
+        index = widget.canvas.shapes.index(target)
+        if not parts:
+            widget.remove_labels([target])
+            # Refreshing the real Shapes list may already remove it from canvas.
+            if target in widget.canvas.shapes:
+                widget.canvas.shapes.remove(target)
+            widget.canvas.selected_shapes = [
+                shape for shape in widget.canvas.selected_shapes if shape is not target
+            ]
+            if getattr(widget, "_shared_boundary_list_shape", None) is target:
+                widget._shared_boundary_list_shape = None
+            removed += 1
+        else:
+            original = target.copy()
+            target.points = [QtCore.QPointF(x, y) for x, y in parts[0]]
+            for offset, ring in enumerate(parts[1:], start=1):
+                piece = original.copy()
+                piece.points = [QtCore.QPointF(x, y) for x, y in ring]
+                piece.selected = False
+                widget.canvas.shapes.insert(index + offset, piece)
+                widget.add_label(piece)
+        changed = True
+
+    if changed:
+        # Keep completion and automatic clipping in one undo operation.
+        widget.canvas.update()
+        widget._refresh_shape_filters()
+        # Adding/removing real list rows can trigger canvas.load_shapes(),
+        # which adds intermediate snapshots. Discard only those extra entries.
+        widget.canvas.shapes_backups[:] = undo_history
+        _replace_undo_snapshot(widget)
+        widget.set_dirty()
+        message = "已按旧区域边界裁剪新多边形；旧区域保持不变，Ctrl+Z 可撤销"
+        if removed:
+            message += f"；{removed} 个新多边形完全被覆盖，已移除"
+        widget.statusBar().showMessage(message, 8000)
+    if skipped:
+        widget.statusBar().showMessage(
+            f"有 {skipped} 个新多边形因锁定或处理失败未裁剪，请检查标注", 8000
+        )
+    return changed
+
+
+def _carve_widget(
+    widget, new_shapes, *, force: bool = False, preserve_existing: bool = True
+) -> bool:
+    """Default to existing-region priority; retain the explicit reverse tool."""
     from PyQt6 import QtCore
 
     if not force and not widget.shared_boundary_action.isChecked():
         return False
+    if preserve_existing:
+        return _clip_new_regions(widget, new_shapes)
     changed = False
     skipped_locked = 0
     for new_shape in list(new_shapes):
@@ -621,7 +714,8 @@ def _carve_widget(widget, new_shapes, *, force: bool = False) -> bool:
             index = widget.canvas.shapes.index(old_shape)
             if not parts:
                 widget.remove_labels([old_shape])
-                widget.canvas.shapes.pop(index)
+                if old_shape in widget.canvas.shapes:
+                    widget.canvas.shapes.remove(old_shape)
                 widget.canvas.selected_shapes = [
                     shape for shape in widget.canvas.selected_shapes
                     if shape is not old_shape
@@ -1046,10 +1140,10 @@ def install() -> None:
         self.shared_boundary_same_deduct_button = same_deduct
         self.shape_dock.parentWidget().layout().insertWidget(2, same_deduct)
 
-        action = QtGui.QAction("新区域覆盖旧多边形（共边）", self)
+        action = QtGui.QAction("旧区域优先：自动裁剪新多边形（共边）", self)
         action.setCheckable(True)
         action.setChecked(True)
-        action.setToolTip("新多边形与旧类别重叠时，自动从旧多边形扣除重叠部分")
+        action.setToolTip("保留已有类别的边界；新多边形完成后，自动从新区域扣除其他类别旧区域的重叠，锁定旧区域也作为参考")
         self.shared_boundary_action = action
         self.menus.edit.addSeparator()
         self.menus.edit.addAction(action)
@@ -1068,7 +1162,8 @@ def install() -> None:
         reconcile.setToolTip("选中多边形向外扩展后，再次从其他类别中扣除重叠部分")
         reconcile.triggered.connect(
             lambda: _carve_widget(
-                self, list(self.canvas.selected_shapes), force=True
+                self, list(self.canvas.selected_shapes), force=True,
+                preserve_existing=False,
             )
         )
         self.menus.edit.addAction(reconcile)

@@ -429,6 +429,12 @@ class SharedBoundaryTests(unittest.TestCase):
             def set_dirty(self):
                 self.dirty = True
 
+            def statusBar(self):
+                return self
+
+            def showMessage(self, message, timeout):
+                self.message = message
+
         old = shape("工程渣土", [(0, 0), (10, 0), (10, 10), (0, 10)])
         new = shape("装修垃圾", [(5, -1), (12, -1), (12, 11), (5, 11)])
         widget = Widget([old, new])
@@ -437,36 +443,141 @@ class SharedBoundaryTests(unittest.TestCase):
         self.assertEqual(len(widget.canvas.shapes), len(widget.listed))
         self.assertEqual(len(widget.canvas.shapes_backups), 2)
         self.assertEqual(widget.canvas.shapes_backups[-1][0].points, old.points)
-        self.assertAlmostEqual(Polygon([(p.x(), p.y()) for p in old.points]).area, 50)
+        self.assertAlmostEqual(Polygon([(p.x(), p.y()) for p in old.points]).area, 100)
+        self.assertAlmostEqual(Polygon([(p.x(), p.y()) for p in new.points]).area, 34)
+        self.assertEqual(widget.canvas.shapes_backups[-1][1].points, new.points)
 
     def test_widget_preserves_locked_shapes(self):
-        from PyQt6.QtCore import QPointF
-        from anylabeling.views.labeling.shape import Shape
-
-        old = Shape(label="工程渣土", shape_type="polygon")
-        old.points = [QPointF(x, y) for x, y in [(0, 0), (10, 0), (10, 10), (0, 10)]]
+        widget, old, new = self._automatic_fixture()
         old.locked = True
-        new = Shape(label="装修垃圾", shape_type="polygon")
-        new.points = [QPointF(x, y) for x, y in [(5, 0), (12, 0), (12, 10), (5, 10)]]
+        original = list(old.points)
+        self.assertTrue(_carve_widget(widget, [new]))
+        self.assertEqual(old.points, original)
+        self.assertTrue(old.locked)
+        self.assertAlmostEqual(self._shape_geometry(new).area, 20)
 
-        class Widget:
-            shared_boundary_action = None
+    @staticmethod
+    def _shape_geometry(shape):
+        return Polygon([(p.x(), p.y()) for p in shape.points])
 
-            def __init__(self):
-                self.canvas = type("Canvas", (), {"shapes": [old, new]})()
-                self.shared_boundary_action = type("Action", (), {"isChecked": lambda self: True})()
-                self.message = None
+    def _automatic_fixture(self, new_points=None):
+        widget, old, new = self._deduction_fixture(second_points=new_points)
+        widget.shared_boundary_action = type(
+            "Action", (), {"isChecked": lambda self: True}
+        )()
+        return widget, old, new
 
-            def statusBar(self):
-                return self
+    def test_auto_clip_removes_fully_covered_new_shape_only(self):
+        widget, old, new = self._automatic_fixture([(1, 1), (2, 1), (2, 2), (1, 2)])
+        old_points = list(old.points)
+        widget.canvas.selected_shapes = [new]
+        self.assertTrue(_carve_widget(widget, [new]))
+        self.assertEqual(widget.canvas.shapes, [old])
+        self.assertEqual(widget.listed, [old])
+        self.assertEqual(widget.canvas.selected_shapes, [])
+        self.assertIsNone(widget._shared_boundary_list_shape)
+        self.assertEqual(old.points, old_points)
+        self.assertEqual(len(widget.canvas.shapes_backups), 2)
+        self.assertEqual(len(widget.canvas.shapes_backups[-1]), 1)
+        self.assertIn("完全被覆盖", widget.message)
 
-            def showMessage(self, message, timeout):
-                self.message = message
+    def test_auto_clip_splits_new_shape_and_preserves_metadata(self):
+        from PyQt6.QtCore import QPointF
 
-        widget = Widget()
+        widget, old, new = self._automatic_fixture([(0, 0), (10, 0), (10, 10), (0, 10)])
+        old.points = [QPointF(x, y) for x, y in [(4, -1), (6, -1), (6, 11), (4, 11)]]
+        old_before = list(old.points)
+        new.group_id = 17
+        new.description = "保留新区域属性"
+        new.flags = {"checked": True}
+        self.assertTrue(_carve_widget(widget, [new]))
+        pieces = [s for s in widget.canvas.shapes if s is not old]
+        self.assertEqual(len(pieces), 2)
+        self.assertEqual(len(widget.listed), 3)
+        result = unary_union([self._shape_geometry(s) for s in pieces])
+        self.assertAlmostEqual(result.area, 80)
+        self.assertAlmostEqual(result.intersection(self._shape_geometry(old)).area, 0)
+        self.assertEqual(old.points, old_before)
+        self.assertTrue(all(s.group_id == 17 and s.description == new.description
+                            and s.flags == new.flags for s in pieces))
+        self.assertEqual(len(widget.canvas.shapes_backups[-1]), 3)
+
+    def test_auto_clip_enclosed_old_region_leaves_hole_free_new_parts(self):
+        from PyQt6.QtCore import QPointF
+
+        widget, old, new = self._automatic_fixture([(0, 0), (10, 0), (10, 10), (0, 10)])
+        old.points = [QPointF(x, y) for x, y in [(3, 3), (7, 3), (7, 7), (3, 7)]]
+        before = list(old.points)
+        self.assertTrue(_carve_widget(widget, [new]))
+        polygons = [self._shape_geometry(s) for s in widget.canvas.shapes if s is not old]
+        self.assertGreaterEqual(len(polygons), 2)
+        self.assertTrue(all(p.is_valid and not p.interiors for p in polygons))
+        self.assertAlmostEqual(unary_union(polygons).area, 84)
+        self.assertAlmostEqual(unary_union(polygons).intersection(self._shape_geometry(old)).area, 0)
+        self.assertEqual(old.points, before)
+
+    def test_auto_clip_subtracts_union_of_multiple_existing_labels(self):
+        from PyQt6.QtCore import QPointF
+
+        widget, old, new = self._automatic_fixture([(0, 0), (14, 0), (14, 10), (0, 10)])
+        other = old.copy()
+        other.label = "拆除垃圾"
+        other.points = [QPointF(x, y) for x, y in [(8, 0), (12, 0), (12, 10), (8, 10)]]
+        widget.canvas.shapes.insert(1, other)
+        widget.listed.insert(1, other)
+        before = [list(s.points) for s in (old, other)]
+        self.assertTrue(_carve_widget(widget, [new]))
+        self.assertAlmostEqual(self._shape_geometry(new).area, 20)
+        self.assertEqual([list(s.points) for s in (old, other)], before)
+        self.assertEqual(self._shape_geometry(new).bounds, (12, 0, 14, 10))
+
+    def test_auto_clip_disabled_same_class_touching_and_nonpolygon_are_unchanged(self):
+        widget, old, new = self._automatic_fixture()
+        before = list(new.points)
+        widget.shared_boundary_action = type("Action", (), {"isChecked": lambda self: False})()
         self.assertFalse(_carve_widget(widget, [new]))
-        self.assertEqual(len(old.points), 4)
-        self.assertIn("已锁定", widget.message)
+        self.assertEqual(new.points, before)
+        widget.shared_boundary_action = type("Action", (), {"isChecked": lambda self: True})()
+        old.label = new.label
+        self.assertFalse(_carve_widget(widget, [new]))
+        old.label = "工程渣土"
+        old.shape_type = "rectangle"
+        self.assertFalse(_carve_widget(widget, [new]))
+        old.shape_type = "polygon"
+        old.label = "AUTOLABEL_OBJECT"
+        self.assertFalse(_carve_widget(widget, [new]))
+        widget, old, new = self._automatic_fixture([(10, 0), (12, 0), (12, 10), (10, 10)])
+        before = list(new.points)
+        self.assertFalse(_carve_widget(widget, [new]))
+        self.assertEqual(new.points, before)
+
+    def test_auto_clip_locked_new_shape_is_unchanged(self):
+        widget, old, new = self._automatic_fixture()
+        before = [list(s.points) for s in (old, new)]
+        new.locked = True
+        self.assertFalse(_carve_widget(widget, [new]))
+        self.assertEqual([list(s.points) for s in (old, new)], before)
+        self.assertIn("锁定", widget.message)
+
+    def test_auto_clip_batch_candidates_do_not_become_existing_references(self):
+        widget, old, new = self._automatic_fixture()
+        second = new.copy()
+        second.label = "拆除垃圾"
+        widget.canvas.shapes.append(second)
+        widget.listed.append(second)
+        self.assertTrue(_carve_widget(widget, [new, second]))
+        self.assertIn(new, widget.canvas.shapes)
+        self.assertIn(second, widget.canvas.shapes)
+        self.assertAlmostEqual(self._shape_geometry(new).area, 20)
+        self.assertTrue(self._shape_geometry(new).equals(self._shape_geometry(second)))
+        self.assertAlmostEqual(self._shape_geometry(old).area, 100)
+
+    def test_explicit_reverse_tool_still_clips_other_regions(self):
+        widget, old, new = self._automatic_fixture()
+        before = list(new.points)
+        self.assertTrue(_carve_widget(widget, [new], force=True, preserve_existing=False))
+        self.assertAlmostEqual(self._shape_geometry(old).area, 50)
+        self.assertEqual(new.points, before)
 
     def test_linked_refinement_updates_neighbor_shape(self):
         from PyQt6.QtCore import QPointF
