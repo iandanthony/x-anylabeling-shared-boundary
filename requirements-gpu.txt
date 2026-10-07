@@ -1,0 +1,4 @@
+# NVIDIA CUDA 12 runtime. Do not combine with requirements-cpu.txt.
+x-anylabeling-cvhub[gpu]==4.0.6
+shapely==2.1.2
+onnxruntime-gpu[cuda,cudnn]==1.26.0
