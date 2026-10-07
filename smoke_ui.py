@@ -90,6 +90,106 @@ def check_existing_priority(widget):
         widget.label_dialog.pop_up = original_popup
 
 
+def check_cancelled_drawing(widget):
+    """Close the real label dialog, continue drawing, then confirm or discard."""
+    from PyQt6 import QtTest
+    from anylabeling.views.labeling.shape import Shape
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    for mode, dismissal in (("polygon", "close"), ("brush", "close"),
+                            ("polygon", "cancel"), ("brush", "escape")):
+        image_path = Path(test_work.name) / f"cancel-{mode}-{dismissal}.png"
+        image = QtGui.QImage(100, 100, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtCore.Qt.GlobalColor.white)
+        assert image.save(str(image_path))
+        widget.load_file(str(image_path))
+        old = Shape(label="工程渣土", shape_type="polygon")
+        old.points = [QtCore.QPointF(x, y) for x, y in [(0, 0), (10, 0), (10, 10), (0, 10)]]
+        old.close()
+        widget.load_shapes([old])
+        before = list(old.points)
+        widget.unique_label_list.clearSelection()
+        if mode == "brush":
+            widget.toggle_brush_polygon_mode()
+        else:
+            widget.toggle_draw_mode(False, create_mode="polygon")
+        canvas = widget.canvas
+        pending = Shape(shape_type="polygon")
+        pending.points = [QtCore.QPointF(x, y) for x, y in [(5, 0), (12, 0), (12, 10), (5, 10)]]
+        kept_points = list(pending.points)
+        # The press before a double click adds a duplicate; Canvas removes it.
+        pending.points.append(QtCore.QPointF(pending.points[-1]))
+        canvas.current = pending
+        canvas.line.points = [pending[-1], pending[0]]
+
+        def dismiss():
+            assert widget.label_dialog.isVisible()
+            if dismissal == "close":
+                widget.label_dialog.close()
+            elif dismissal == "cancel":
+                widget.label_dialog.button_box.button(
+                    QtWidgets.QDialogButtonBox.StandardButton.Cancel).click()
+            else:
+                QtTest.QTest.keyClick(widget.label_dialog, QtCore.Qt.Key.Key_Escape)
+
+        QtCore.QTimer.singleShot(20, dismiss)
+        double_click = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseButtonDblClick, QtCore.QPointF(10, 10),
+            QtCore.QPointF(10, 10), QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.KeyboardModifier.NoModifier)
+        canvas.mouseDoubleClickEvent(double_click)
+        assert canvas.current is pending and pending.points == kept_points
+        assert not pending.is_closed() and pending.label is None
+        assert canvas.drawing() and canvas._brush_drawing == (mode == "brush")
+        assert canvas.shapes == [old] and old.points == before
+        assert len(canvas.shapes_backups) == 1
+        assert widget.actions.undo_last_point.isEnabled()
+        assert not widget.actions.edit_mode.isEnabled()
+
+        next_point = QtCore.QPointF(2, 15)
+        screen_point = (next_point + canvas.offset_to_center()) * canvas.scale
+        event_type = (QtCore.QEvent.Type.MouseMove if mode == "brush"
+                      else QtCore.QEvent.Type.MouseButtonPress)
+        button = (QtCore.Qt.MouseButton.NoButton if mode == "brush"
+                  else QtCore.Qt.MouseButton.LeftButton)
+        continued = QtGui.QMouseEvent(event_type, screen_point, screen_point, button,
+                                     button, QtCore.Qt.KeyboardModifier.NoModifier)
+        if mode == "brush":
+            canvas.mouseMoveEvent(continued)
+        else:
+            canvas.mousePressEvent(continued)
+        assert len(pending.points) == len(kept_points) + 1
+        assert pending.points[:len(kept_points)] == kept_points
+        if dismissal == "escape":
+            # Esc in the canvas is still the explicit way to abandon a draft.
+            QtTest.QTest.keyClick(canvas, QtCore.Qt.Key.Key_Escape)
+            assert canvas.current is None and canvas.shapes == [old]
+        else:
+            expected = Polygon([(p.x(), p.y()) for p in pending.points]).difference(
+                Polygon([(p.x(), p.y()) for p in old.points]))
+
+            def confirm():
+                widget.label_dialog.edit.setText("装修垃圾")
+                widget.label_dialog.button_box.button(
+                    QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+
+            QtCore.QTimer.singleShot(20, confirm)
+            QtTest.QTest.keyClick(canvas, QtCore.Qt.Key.Key_Return)
+            assert canvas.current is None and len(canvas.shapes) >= 2
+            actual = unary_union([
+                Polygon([(p.x(), p.y()) for p in item.points])
+                for item in canvas.shapes if item is not old
+            ])
+            assert actual.equals(expected) and old.points == before
+            output = image_path.with_suffix(".json")
+            assert widget.save_labels(str(output))
+            assert len(json.loads(output.read_text(encoding="utf-8"))["shapes"]) == len(canvas.shapes)
+            widget.undo_shape_edit()
+            assert len(canvas.shapes) == 1 and canvas.shapes[0].points == before
+        print(f"cancel dialog: {mode}/{dismissal}, vertices and continued drawing passed")
+
+
 def quick_exec(app):
     def check():
         actions = [
@@ -152,6 +252,7 @@ def quick_exec(app):
         print("same class deduction button:", len(same_buttons))
         if actions:
             check_existing_priority(actions[0].parent())
+            check_cancelled_drawing(actions[0].parent())
         if spacing_actions:
             widget = spacing_actions[0].parent()
             controller = widget._settings_controller

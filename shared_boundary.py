@@ -1101,6 +1101,36 @@ def _update_refinement(widget) -> bool:
     return True
 
 
+def _resume_polygon_draft(widget, shape, points, undo_history, *, brush: bool) -> None:
+    """Resume an unlabelled polygon after closing its completion dialog."""
+    from PyQt6 import QtCore
+
+    canvas = widget.canvas
+    if shape in canvas.shapes:
+        canvas.shapes.remove(shape)
+    shape.points = [QtCore.QPointF(point) for point in points]
+    shape.label = None
+    shape.selected = False
+    shape.set_open()
+    shape.highlight_clear()
+    canvas.current = shape
+    canvas.create_mode = "polygon"
+    canvas.set_editing(False)
+    canvas._brush_drawing = brush
+    canvas.line.points = [QtCore.QPointF(points[-1]), QtCore.QPointF(points[-1])]
+    # Completion records a snapshot before the dialog opens; it is not a
+    # committed annotation when the user rejects that dialog.
+    canvas.shapes_backups[:] = undo_history[:-1]
+    canvas.set_hiding(True)
+    widget.toggle_drawing_sensitive(True)
+    canvas.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+    canvas.update()
+    method = "移动鼠标继续描边" if brush else "单击继续添加顶点"
+    widget.statusBar().showMessage(
+        f"已取消类别填写，保留 {len(points)} 个顶点；{method}，Enter 完成；Esc 放弃草稿", 10000
+    )
+
+
 def install() -> None:
     """Add shared-edge mode to the installed UI without replacing its files."""
     from PyQt6 import QtGui, QtWidgets
@@ -1222,8 +1252,35 @@ def install() -> None:
         if self.shared_boundary_refine_action.isChecked():
             self.shared_boundary_refine_action.setChecked(False)
         shape = self.canvas.shapes[-1] if self.canvas.shapes else None
-        original_new_shape(self)
-        if shape is not None and shape in self.canvas.shapes:
+        can_resume = (
+            shape is not None
+            and shape.shape_type == "polygon"
+            and shape.label not in SPECIAL_LABELS
+            and self.canvas.drawing()
+            and not self.canvas.is_auto_labeling
+            and not self.canvas.is_magic_wand_mode
+        )
+        cancelled = False
+        points = list(shape.points) if can_resume else []
+        undo_history = list(self.canvas.shapes_backups)
+        brush = can_resume and not self.actions.create_brush_polygon_mode.isEnabled()
+        original_popup = self.label_dialog.pop_up
+
+        def observe_popup(*args, **kwargs):
+            nonlocal cancelled
+            result = original_popup(*args, **kwargs)
+            cancelled = not result[0]
+            return result
+
+        self.label_dialog.pop_up = observe_popup
+        try:
+            original_new_shape(self)
+        finally:
+            self.label_dialog.pop_up = original_popup
+        if can_resume and cancelled:
+            _resume_polygon_draft(self, shape, points, undo_history, brush=brush)
+            return
+        if shape is not None and shape.label and shape in self.canvas.shapes:
             _carve_widget(self, [shape])
 
     def finish_auto_with_shared_boundary(self):
