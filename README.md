@@ -4,6 +4,14 @@
 
 **扩展版本：1.0.0 · 基础软件：4.0.6 · 推荐环境：Windows 64 位 / Python 3.12。**
 
+## 第一次安装，从这里开始
+
+**请先打开 [Windows 新手安装教程：从下载到第一次保存标注](docs/INSTALL.md)。** 教程按实际操作顺序写明每条命令在哪个窗口执行、成功后应看到什么、失败时去哪里排查。适用 Windows 10 / 11、Intel 或 AMD 的 x64 电脑。
+
+安装路线：**安装 Python 3.12 64 位 → 下载 ZIP 并解压 → 建立专用环境 → 启动与保存验收 → 创建桌面快捷方式**。不需要先安装 Git、Conda，也不需要登录 GitHub。
+
+下载的是扩展源码，基础软件通过教程中的命令安装；SAM2 模型权重另行下载。首次安装可先完成 CPU 路线，确认手工标注工具可用；有 NVIDIA 显卡并需要模型加速时再建立独立 GPU 环境。
+
 ## 文档导航
 
 - [安装说明](docs/INSTALL.md)：新电脑安装、CPU/GPU、复用环境、桌面快捷方式、设置迁移。
@@ -25,27 +33,19 @@
 | 多边形圈选拉直 | Shapes / 编辑 → 多边形圈选顶点拉直 | 圈住连续顶点，预览后保留首末点并连接 |
 | 连续描边密度 | 编辑 → 画笔多边形点间距… | 设置 Ctrl+N 画笔多边形的自动加点间距 |
 
-## 快速开始（Windows，CPU）
+## 安装步骤索引（Windows）
 
-先安装 Python 3.12 64 位；使用 PowerShell：
+| 顺序 | 操作与详细步骤 | 完成检查 |
+| --- | --- | --- |
+| 1 | [安装指定版本的 Python](docs/INSTALL.md#install-python) | Python 3.12.x，64 位 |
+| 2 | [Code → Download ZIP，解压](docs/INSTALL.md#download-source) | 进入直接包含 launch.py 的文件夹 |
+| 3 | [用 PowerShell 安装 CPU 依赖](docs/INSTALL.md#install-cpu) | pip check 显示 No broken requirements found. |
+| 4 | [首次启动并保存测试标注](docs/INSTALL.md#first-launch) | 有新增菜单，能生成 JSON |
+| 5 | [创建桌面快捷方式](docs/INSTALL.md#desktop-shortcut) | 双击后仍为共边版 |
+| 可选 | [下载 SAM2 并实际分割](docs/INSTALL.md#sam2-model) | 生成候选轮廓并保存 |
+| 可选 | [NVIDIA GPU 安装](docs/INSTALL.md#install-gpu) | 单独环境、驱动和实际推理验收 |
 
-```powershell
-git clone https://github.com/iandanthony/x-anylabeling-shared-boundary.git
-cd x-anylabeling-shared-boundary
-```
-
-新环境使用：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements-cpu.txt
-.\.venv\Scripts\python.exe launch.py
-```
-
-NVIDIA GPU 环境改用 `requirements-gpu.txt`。详细步骤见[安装说明](docs/INSTALL.md)。没有 Git 也可在仓库页面选择 **Code → Download ZIP**，解压后执行安装命令。
-
-程序打开后，先用一张测试图片确认“编辑”菜单出现上述新增功能。已有原版可复用 Python 环境，启动时必须执行本仓库 `launch.py`，直接运行 `xanylabeling` 不会加载扩展。
+遇到问题按[安装错误逐项排查](docs/INSTALL.md#installation-errors)处理。已有原版可按[复用环境](docs/INSTALL.md#existing-environment)操作；启动时执行本仓库 `launch.py`，直接运行 `xanylabeling` 不会加载扩展。
 
 ## 标注流程示例
 
@@ -61,11 +61,13 @@ NVIDIA GPU 环境改用 `requirements-gpu.txt`。详细步骤见[安装说明](d
 ## 测试与适用范围
 
 ```powershell
-python -m unittest test_shared_boundary.py test_launch.py
-python smoke_ui.py
+.\.venv\Scripts\python.exe -m unittest test_shared_boundary.py test_launch.py
+.\.venv\Scripts\python.exe smoke_ui.py
 ```
 
-`test_shared_boundary.py` 为当前版本的 26 项几何测试；`test_launch.py` 验证发布启动器的路径处理；`smoke_ui.py` 用实际 PyQt 窗口离屏检查菜单、按钮及点间距设置保存。实际验证平台是 Windows / Python 3.12 / X-AnyLabeling 4.0.6。CPU 全新依赖安装、其他系统和不同显卡需在目标机器验收；测试不等同于 SAM 模型分割质量验证。
+`test_shared_boundary.py` 为当前版本的 26 项几何测试；`test_launch.py` 有 3 项启动器路径测试；`smoke_ui.py` 用实际 PyQt 窗口离屏检查菜单、按钮及点间距设置保存。
+
+2026-10-07 在 Windows / Python 3.12.14 的独立 CPU 虚拟环境中，重新安装 `requirements-cpu.txt` 后通过 `pip check`、上述 29 项测试和离屏 UI 检查。此验证没有下载或运行 SAM2；首次安装仍需按教程完成可见界面、JSON 保存及所需模型的验收。其他系统、不同显卡和驱动需在目标机器验收。
 
 ## 实现与数据
 
