@@ -1131,6 +1131,140 @@ def _resume_polygon_draft(widget, shape, points, undo_history, *, brush: bool) -
     )
 
 
+def _following_polygon(canvas) -> bool:
+    return (
+        canvas.drawing()
+        and canvas.create_mode == "polygon"
+        and canvas.current is not None
+        and canvas._brush_drawing
+    )
+
+
+def _install_brush_navigation(widget_class) -> None:
+    """Anchor wheel zoom in image coordinates and ignore navigation-only motion."""
+    from PyQt6 import QtCore
+    from anylabeling.views.labeling.widgets.canvas import Canvas
+
+    original_hint = Canvas.minimumSizeHint
+    original_move = Canvas.mouseMoveEvent
+    original_wheel = Canvas.wheelEvent
+    original_zoom = widget_class.zoom_request
+    original_paint = widget_class.paint_canvas
+    original_fit_window = widget_class.set_fit_window
+    original_fit_width = widget_class.set_fit_width
+
+    def minimum_hint(self):
+        hint = original_hint(self)
+        padding = getattr(self, "_shared_boundary_zoom_padding", None)
+        if padding and self.pixmap is not None and not self.pixmap.isNull():
+            hint += QtCore.QSize(2 * padding[0], 2 * padding[1])
+        return hint
+
+    def mouse_move(self, event):
+        position = QtCore.QPointF(event.globalPosition())
+        self._shared_boundary_pointer_global = position
+        if not _following_polygon(self):
+            return original_move(self, event)
+        navigating = bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier)
+        navigating = navigating or self._space_pressed or self._space_panning
+        anchor = getattr(self, "_shared_boundary_navigation_global", None)
+        if navigating:
+            self._shared_boundary_navigation_global = position
+        stationary = anchor is not None and (
+            abs(position.x() - anchor.x()) <= 1
+            and abs(position.y() - anchor.y()) <= 1
+        )
+        if navigating or stationary:
+            # Still update the preview/crosshair, without adding or closing points.
+            draft = self.current
+            self._brush_drawing = False
+            try:
+                return original_move(self, event)
+            finally:
+                if self.current is draft and self.drawing():
+                    self._brush_drawing = True
+        self._shared_boundary_navigation_global = None
+        return original_move(self, event)
+
+    def wheel(self, event):
+        if _following_polygon(self):
+            position = QtCore.QPointF(event.globalPosition())
+            self._shared_boundary_pointer_global = position
+            self._shared_boundary_navigation_global = position
+            owner = getattr(self, "_shared_boundary_owner", None)
+            if owner is not None and event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+                # Keep the wheel's floating-point position (the stock signal
+                # rounds to QPoint and loses subpixel accuracy at low zoom).
+                owner.zoom_request(event.angleDelta().y(), event.position())
+                event.accept()
+                return
+        return original_wheel(self, event)
+
+    def paint(self):
+        canvas = self.canvas
+        if _following_polygon(canvas) and canvas.scale != 0.01 * self.zoom_widget.value():
+            position = getattr(canvas, "_shared_boundary_pointer_global", None)
+            if position is not None:
+                canvas._shared_boundary_navigation_global = QtCore.QPointF(position)
+        return original_paint(self)
+
+    def zoom(self, delta, position):
+        canvas = self.canvas
+        if not _following_polygon(canvas):
+            return original_zoom(self, delta, position)
+        if not delta:
+            return
+        viewport = self._canvas_scroll_area.viewport()
+        position = QtCore.QPointF(position)
+        image_point = canvas.transform_pos(position)
+        viewport_point = QtCore.QPointF(canvas.mapTo(viewport, QtCore.QPoint())) + position
+        global_point = QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint())) + position
+        cached_anchor = getattr(canvas, "_shared_boundary_zoom_anchor", None)
+        if cached_anchor is not None and cached_anchor[0] == global_point:
+            image_point = cached_anchor[1]
+        canvas._shared_boundary_zoom_anchor = (global_point, image_point)
+        canvas._shared_boundary_pointer_global = global_point
+        canvas._shared_boundary_navigation_global = global_point
+        # A scrollable margin makes anchoring possible even when the image is
+        # smaller than the viewport; otherwise scrollbar limits force a jump.
+        canvas._shared_boundary_zoom_padding = (viewport.width(), viewport.height())
+        canvas.updateGeometry()
+        self.add_zoom(1.1 if delta > 0 else 0.9)
+        canvas.adjustSize()
+        projected = (image_point + canvas.offset_to_center()) * canvas.scale
+        origin = canvas.mapTo(viewport, QtCore.QPoint())
+        for orientation, shift in (
+            (QtCore.Qt.Orientation.Horizontal, origin.x() + projected.x() - viewport_point.x()),
+            (QtCore.Qt.Orientation.Vertical, origin.y() + projected.y() - viewport_point.y()),
+        ):
+            self.set_scroll(orientation, self.scroll_bars[orientation].value() + shift)
+        canvas.update()
+
+    def clear_padding(self):
+        canvas = self.canvas
+        position = getattr(canvas, "_shared_boundary_pointer_global", None)
+        canvas._shared_boundary_navigation_global = position
+        canvas._shared_boundary_zoom_padding = None
+        canvas._shared_boundary_zoom_anchor = None
+        canvas.updateGeometry()
+
+    def fit_window(self, *args, **kwargs):
+        clear_padding(self)
+        return original_fit_window(self, *args, **kwargs)
+
+    def fit_width(self, *args, **kwargs):
+        clear_padding(self)
+        return original_fit_width(self, *args, **kwargs)
+
+    Canvas.minimumSizeHint = minimum_hint
+    Canvas.mouseMoveEvent = mouse_move
+    Canvas.wheelEvent = wheel
+    widget_class.zoom_request = zoom
+    widget_class.paint_canvas = paint
+    widget_class.set_fit_window = fit_window
+    widget_class.set_fit_width = fit_width
+
+
 def install() -> None:
     """Add shared-edge mode to the installed UI without replacing its files."""
     from PyQt6 import QtGui, QtWidgets
@@ -1139,6 +1273,7 @@ def install() -> None:
     if getattr(LabelingWidget, "_shared_boundary_installed", False):
         return
 
+    _install_brush_navigation(LabelingWidget)
     original_init = LabelingWidget.__init__
     original_new_shape = LabelingWidget.new_shape
     original_finish_auto = LabelingWidget.finish_auto_labeling_object
@@ -1147,6 +1282,7 @@ def install() -> None:
 
     def init_with_shared_boundary(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        self.canvas._shared_boundary_owner = self
         # The stock list uses checkboxes for visibility and canvas hover can
         # look like a lasting selection. Provide an explicit row-based action.
         deduct_button = QtWidgets.QPushButton(
@@ -1302,6 +1438,10 @@ def install() -> None:
         original_undo(self)
 
     def load_file_with_shared_boundary(self, *args, **kwargs):
+        self.canvas._shared_boundary_zoom_padding = None
+        self.canvas._shared_boundary_navigation_global = None
+        self.canvas._shared_boundary_pointer_global = None
+        self.canvas._shared_boundary_zoom_anchor = None
         _cancel_vertex_tools(self)
         action = getattr(self, "shared_boundary_refine_action", None)
         if action is not None and action.isChecked():

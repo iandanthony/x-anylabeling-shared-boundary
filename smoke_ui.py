@@ -190,7 +190,134 @@ def check_cancelled_drawing(widget):
         print(f"cancel dialog: {mode}/{dismissal}, vertices and continued drawing passed")
 
 
+def check_brush_zoom(widget):
+    """Measure real scroll-area anchoring and reject navigation-only points."""
+    from anylabeling.views.labeling.shape import Shape
+
+    for name, width, height in (("landscape", 2000, 400),
+                                ("portrait", 400, 2000),
+                                ("edge", 1600, 900),
+                                ("panned", 2400, 1800)):
+        image_path = Path(test_work.name) / f"zoom-{name}.png"
+        image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtCore.Qt.GlobalColor.white)
+        assert image.save(str(image_path))
+        widget.load_file(str(image_path))
+        widget.set_fit_window()
+        QtWidgets.QApplication.processEvents()
+        canvas = widget.canvas
+        if name == "panned":
+            widget.set_zoom(160)
+            widget.set_scroll(QtCore.Qt.Orientation.Horizontal, 900)
+            widget.set_scroll(QtCore.Qt.Orientation.Vertical, 700)
+            QtWidgets.QApplication.processEvents()
+            viewport = widget._canvas_scroll_area.viewport()
+            local = canvas.mapFrom(viewport, QtCore.QPoint(viewport.width() // 2,
+                                                          viewport.height() // 2))
+            anchor = canvas.transform_pos(QtCore.QPointF(local))
+        elif name == "edge":
+            anchor = QtCore.QPointF(width * 0.02, height * 0.025)
+        else:
+            anchor = QtCore.QPointF(width * 0.63, height * 0.57)
+        widget.toggle_draw_mode(False, create_mode="polygon")
+        widget.toggle_brush_polygon_mode()
+        pending = Shape(shape_type="polygon")
+        direction = 1 if name == "edge" else -1
+        pending.points = [anchor + direction * QtCore.QPointF(200, 100),
+                          anchor + direction * QtCore.QPointF(150, 80), QtCore.QPointF(anchor)]
+        canvas.current = pending
+        canvas.line.points = [pending[-1], pending[-1]]
+        before = list(pending.points)
+        local = (anchor + canvas.offset_to_center()) * canvas.scale
+        fixed_global = QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint())) + local
+        errors = []
+        for delta in (120, 120, 120, -120, -120, -120, -120, -120):
+            local = fixed_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+            event = QtGui.QWheelEvent(
+                local, fixed_global, QtCore.QPoint(), QtCore.QPoint(0, delta),
+                QtCore.Qt.MouseButton.NoButton, QtCore.Qt.KeyboardModifier.ControlModifier,
+                QtCore.Qt.ScrollPhase.NoScrollPhase, False)
+            canvas.wheelEvent(event)
+            QtWidgets.QApplication.processEvents()
+            projected = (anchor + canvas.offset_to_center()) * canvas.scale
+            projected += QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+            error = max(abs(projected.x() - fixed_global.x()),
+                        abs(projected.y() - fixed_global.y()))
+            errors.append(error)
+            assert error <= 1, (name, delta, error, canvas.scale)
+            assert canvas.current is pending and pending.points == before
+            # A stationary event after releasing Ctrl must not add a vertex.
+            local = fixed_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+            stationary = QtGui.QMouseEvent(
+                QtCore.QEvent.Type.MouseMove, local, fixed_global,
+                QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+                QtCore.Qt.KeyboardModifier.NoModifier)
+            canvas.mouseMoveEvent(stationary)
+            assert pending.points == before
+        # Scrolling beneath a stationary pointer must not create a vertex either.
+        local = fixed_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+        scroll = QtGui.QWheelEvent(
+            local, fixed_global, QtCore.QPoint(), QtCore.QPoint(0, -120),
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.KeyboardModifier.NoModifier,
+            QtCore.Qt.ScrollPhase.NoScrollPhase, False)
+        canvas.wheelEvent(scroll)
+        local = fixed_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+        stationary = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, local, fixed_global,
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier)
+        canvas.mouseMoveEvent(stationary)
+        assert pending.points == before
+        # Exercise the actual Space-drag path and its scroll signals.
+        canvas._space_pressed = True
+        canvas._space_panning = True
+        canvas._space_pan_prev_point = QtCore.QPointF(local)
+        pan_global = fixed_global + QtCore.QPointF(10, 10)
+        pan = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, local + QtCore.QPointF(10, 10), pan_global,
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.NoModifier)
+        canvas.mouseMoveEvent(pan)
+        canvas._space_pressed = canvas._space_panning = False
+        canvas._space_pan_suppress_until_release = False
+        local = pan_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+        after_pan = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, local, pan_global,
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier)
+        canvas.mouseMoveEvent(after_pan)
+        assert pending.points == before
+        # Ctrl deliberately pauses following even if the physical pointer moves.
+        moved_global = fixed_global + QtCore.QPointF(50, 30)
+        local = moved_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+        paused = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, local, moved_global,
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.ControlModifier)
+        canvas.mouseMoveEvent(paused)
+        assert pending.points == before
+        moved_global += QtCore.QPointF(60, 170)
+        local = moved_global - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+        resumed = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, local, moved_global,
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier)
+        canvas.mouseMoveEvent(resumed)
+        assert len(pending.points) == len(before) + 1
+        assert pending.points[:len(before)] == before
+        print(f"brush zoom: {name}, max anchor error {max(errors):.3f}px, no extra vertices, resume passed")
+        widget.set_fit_window()
+        assert canvas._shared_boundary_zoom_padding is None
+        canvas.current = None
+        canvas._brush_drawing = False
+
+
 def quick_exec(app):
+    # Fail safely if a regression unexpectedly opens an unattended modal dialog.
+    watchdog = QtCore.QTimer(app)
+    watchdog.setSingleShot(True)
+    watchdog.timeout.connect(lambda: app.exit(2))
+    watchdog.start(60000)
     def check():
         actions = [
             action
@@ -253,6 +380,7 @@ def quick_exec(app):
         if actions:
             check_existing_priority(actions[0].parent())
             check_cancelled_drawing(actions[0].parent())
+            check_brush_zoom(actions[0].parent())
         if spacing_actions:
             widget = spacing_actions[0].parent()
             controller = widget._settings_controller
