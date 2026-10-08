@@ -1,6 +1,6 @@
 # Windows 新手安装教程：从下载到第一次保存标注
 
-**适用：共边扩展 1.0.3 / X-AnyLabeling 4.0.6；Windows 10 / 11，Intel 或 AMD 的 x64 电脑，Python 3.12 64 位。**
+**适用：共边扩展 1.0.4 / X-AnyLabeling 4.0.6；Windows 10 / 11，Intel 或 AMD 的 x64 电脑，Python 3.12 64 位。**
 
 主流程采用 **下载 ZIP → 安装专用 Python 环境 → 启动验收 → 桌面快捷方式**，不要求学习 Git 或 Conda，也不要求登录 GitHub。日常安装完成后可双击桌面入口。
 

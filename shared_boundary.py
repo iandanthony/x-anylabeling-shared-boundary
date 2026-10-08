@@ -1141,12 +1141,17 @@ def _following_polygon(canvas) -> bool:
 
 
 def _install_brush_navigation(widget_class) -> None:
-    """Anchor wheel zoom in image coordinates and ignore navigation-only motion."""
+    """Anchor zoom and pan without recording navigation as polygon vertices."""
     from PyQt6 import QtCore
     from anylabeling.views.labeling.widgets.canvas import Canvas
 
     original_hint = Canvas.minimumSizeHint
     original_move = Canvas.mouseMoveEvent
+    original_press = Canvas.mousePressEvent
+    original_release = Canvas.mouseReleaseEvent
+    original_double_click = Canvas.mouseDoubleClickEvent
+    original_focus_out = Canvas.focusOutEvent
+    original_reset = Canvas.reset_state
     original_wheel = Canvas.wheelEvent
     original_zoom = widget_class.zoom_request
     original_paint = widget_class.paint_canvas
@@ -1163,6 +1168,24 @@ def _install_brush_navigation(widget_class) -> None:
     def mouse_move(self, event):
         position = QtCore.QPointF(event.globalPosition())
         self._shared_boundary_pointer_global = position
+        drag = getattr(self, "_shared_boundary_middle_pan", None)
+        if drag is not None:
+            if event.buttons() & QtCore.Qt.MouseButton.MiddleButton:
+                owner = self._shared_boundary_owner
+                delta = position - drag[0]
+                for orientation, shift in (
+                    (QtCore.Qt.Orientation.Horizontal, delta.x()),
+                    (QtCore.Qt.Orientation.Vertical, delta.y()),
+                ):
+                    owner.set_scroll(orientation, drag[1][orientation] - shift)
+                self.override_cursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            # Recover when the button was released outside the canvas.
+            stop_pan(self)
+        if paused(self):
+            event.accept()
+            return
         if not _following_polygon(self):
             return original_move(self, event)
         navigating = bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier)
@@ -1185,6 +1208,90 @@ def _install_brush_navigation(widget_class) -> None:
                     self._brush_drawing = True
         self._shared_boundary_navigation_global = None
         return original_move(self, event)
+
+    def paused(canvas):
+        draft = getattr(canvas, "_shared_boundary_paused_draft", None)
+        return draft is not None and canvas.current is draft and _following_polygon(canvas)
+
+    def stop_pan(canvas):
+        canvas._shared_boundary_middle_pan = None
+        canvas._shared_boundary_zoom_anchor = None
+        canvas.restore_cursor()
+        if paused(canvas):
+            canvas._shared_boundary_owner.statusBar().showMessage(
+                "描边已暂停；移回最后一个边界点附近，单击左键继续描边（中键仍可平移）", 10000
+            )
+
+    def mouse_press(self, event):
+        owner = getattr(self, "_shared_boundary_owner", None)
+        if (event.button() == QtCore.Qt.MouseButton.MiddleButton
+                and owner is not None and not self.is_loading
+                and self.drawing() and self.create_mode == "polygon"
+                and self.pixmap is not None and not self.pixmap.isNull()):
+            if _following_polygon(self):
+                self._shared_boundary_paused_draft = self.current
+                # Freeze the preview at the last recorded vertex as well.
+                self.line.points = [self.current[-1], self.current[-1]]
+            viewport = owner._canvas_scroll_area.viewport()
+            position = QtCore.QPointF(event.position())
+            image_point = self.transform_pos(position)
+            viewport_point = QtCore.QPointF(self.mapTo(viewport, QtCore.QPoint())) + position
+            # Permit panning fitted / small images, preserving their position
+            # when the scrollable margin is first introduced.
+            self._shared_boundary_zoom_padding = (viewport.width(), viewport.height())
+            self.updateGeometry()
+            self.adjustSize()
+            projected = (image_point + self.offset_to_center()) * self.scale
+            origin = self.mapTo(viewport, QtCore.QPoint())
+            for orientation, shift in (
+                (QtCore.Qt.Orientation.Horizontal, origin.x() + projected.x() - viewport_point.x()),
+                (QtCore.Qt.Orientation.Vertical, origin.y() + projected.y() - viewport_point.y()),
+            ):
+                owner.set_scroll(orientation, owner.scroll_bars[orientation].value() + shift)
+            self._shared_boundary_middle_pan = (
+                QtCore.QPointF(event.globalPosition()),
+                {orientation: bar.value() for orientation, bar in owner.scroll_bars.items()},
+            )
+            self._shared_boundary_zoom_anchor = None
+            self.override_cursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+            self.update()
+            event.accept()
+            return
+        if getattr(self, "_shared_boundary_middle_pan", None) is not None:
+            event.accept()
+            return
+        if paused(self) and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._shared_boundary_paused_draft = None
+            self._shared_boundary_navigation_global = QtCore.QPointF(event.globalPosition())
+            owner.statusBar().showMessage("已恢复连续描边；移动鼠标继续，Enter 完成", 5000)
+            # This click resumes following; it is not a new polygon vertex.
+            event.accept()
+            return
+        return original_press(self, event)
+
+    def mouse_release(self, event):
+        if (event.button() == QtCore.Qt.MouseButton.MiddleButton
+                and getattr(self, "_shared_boundary_middle_pan", None) is not None):
+            stop_pan(self)
+            event.accept()
+            return
+        return original_release(self, event)
+
+    def double_click(self, event):
+        if paused(self) or getattr(self, "_shared_boundary_middle_pan", None) is not None:
+            event.accept()
+            return
+        return original_double_click(self, event)
+
+    def focus_out(self, event):
+        if getattr(self, "_shared_boundary_middle_pan", None) is not None:
+            stop_pan(self)
+        return original_focus_out(self, event)
+
+    def reset(self, *args, **kwargs):
+        self._shared_boundary_middle_pan = None
+        self._shared_boundary_paused_draft = None
+        return original_reset(self, *args, **kwargs)
 
     def wheel(self, event):
         if _following_polygon(self):
@@ -1258,6 +1365,11 @@ def _install_brush_navigation(widget_class) -> None:
 
     Canvas.minimumSizeHint = minimum_hint
     Canvas.mouseMoveEvent = mouse_move
+    Canvas.mousePressEvent = mouse_press
+    Canvas.mouseReleaseEvent = mouse_release
+    Canvas.mouseDoubleClickEvent = double_click
+    Canvas.focusOutEvent = focus_out
+    Canvas.reset_state = reset
     Canvas.wheelEvent = wheel
     widget_class.zoom_request = zoom
     widget_class.paint_canvas = paint
@@ -1438,6 +1550,8 @@ def install() -> None:
         original_undo(self)
 
     def load_file_with_shared_boundary(self, *args, **kwargs):
+        self.canvas._shared_boundary_middle_pan = None
+        self.canvas._shared_boundary_paused_draft = None
         self.canvas._shared_boundary_zoom_padding = None
         self.canvas._shared_boundary_navigation_global = None
         self.canvas._shared_boundary_pointer_global = None

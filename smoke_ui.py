@@ -312,6 +312,127 @@ def check_brush_zoom(widget):
         canvas._brush_drawing = False
 
 
+def check_middle_pan(widget):
+    """Pan real scrollbars in four directions while protecting the draft."""
+    from PyQt6 import QtTest
+    from anylabeling.views.labeling.shape import Shape
+
+    for mode in ("brush-fit", "brush-zoom", "polygon"):
+        image_path = Path(test_work.name) / f"middle-{mode}.png"
+        image = QtGui.QImage(1400, 900, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtCore.Qt.GlobalColor.white)
+        assert image.save(str(image_path))
+        widget.load_file(str(image_path))
+        widget.set_fit_window()
+        QtWidgets.QApplication.processEvents()
+        old = Shape(label="装修垃圾", shape_type="polygon")
+        old.points = [QtCore.QPointF(x, y) for x, y in ((0, 0), (100, 0), (100, 100), (0, 100))]
+        old.close()
+        widget.load_shapes([old])
+        widget.toggle_draw_mode(False, create_mode="polygon")
+        if mode.startswith("brush"):
+            widget.toggle_brush_polygon_mode()
+        canvas = widget.canvas
+        pending = Shape(shape_type="polygon")
+        pending.points = [QtCore.QPointF(350, 250), QtCore.QPointF(700, 250),
+                          QtCore.QPointF(700, 500)]
+        canvas.current = pending
+        canvas.line.points = [pending[-1], pending[-1]]
+        before = list(pending.points)
+        history_size = len(canvas.shapes_backups)
+
+        def projected(point):
+            return (QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+                    + (point + canvas.offset_to_center()) * canvas.scale)
+
+        def mouse(kind, global_position, button=QtCore.Qt.MouseButton.NoButton,
+                  buttons=QtCore.Qt.MouseButton.NoButton):
+            local = global_position - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+            return QtGui.QMouseEvent(kind, local, global_position, button, buttons,
+                                    QtCore.Qt.KeyboardModifier.NoModifier)
+
+        start = projected(pending[-1])
+        if mode == "brush-zoom":
+            local = start - QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint()))
+            canvas.wheelEvent(QtGui.QWheelEvent(
+                local, start, QtCore.QPoint(), QtCore.QPoint(0, -120),
+                QtCore.Qt.MouseButton.NoButton, QtCore.Qt.KeyboardModifier.ControlModifier,
+                QtCore.Qt.ScrollPhase.NoScrollPhase, False))
+            QtWidgets.QApplication.processEvents()
+        start = projected(pending[-1])
+        canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress, start,
+                                    QtCore.Qt.MouseButton.MiddleButton,
+                                    QtCore.Qt.MouseButton.MiddleButton))
+        QtWidgets.QApplication.processEvents()
+        initial = projected(pending[-1])
+        assert max(abs(initial.x() - start.x()), abs(initial.y() - start.y())) <= 1
+        for dx, dy in ((90, 0), (90, 70), (-60, 70), (-60, -50)):
+            pointer = start + QtCore.QPointF(dx, dy)
+            canvas.mouseMoveEvent(mouse(QtCore.QEvent.Type.MouseMove, pointer,
+                                        buttons=QtCore.Qt.MouseButton.MiddleButton))
+            QtWidgets.QApplication.processEvents()
+            actual = projected(pending[-1]) - initial
+            assert abs(actual.x() - dx) <= 1 and abs(actual.y() - dy) <= 1, (mode, dx, dy, actual)
+            assert canvas.current is pending and pending.points == before
+            assert len(canvas.shapes_backups) == history_size
+        canvas.mouseReleaseEvent(mouse(QtCore.QEvent.Type.MouseButtonRelease, pointer,
+                                      QtCore.Qt.MouseButton.MiddleButton))
+        assert canvas._shared_boundary_middle_pan is None
+        # Returning the pointer to the boundary after the pan must be harmless.
+        endpoint = projected(pending[-1])
+        for target in (endpoint + QtCore.QPointF(130, 100), endpoint):
+            canvas.mouseMoveEvent(mouse(QtCore.QEvent.Type.MouseMove, target))
+            assert pending.points == before
+        if mode.startswith("brush"):
+            assert canvas._shared_boundary_paused_draft is pending
+            canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress, endpoint,
+                                        QtCore.Qt.MouseButton.LeftButton,
+                                        QtCore.Qt.MouseButton.LeftButton))
+            canvas.mouseReleaseEvent(mouse(QtCore.QEvent.Type.MouseButtonRelease, endpoint,
+                                          QtCore.Qt.MouseButton.LeftButton))
+            assert pending.points == before  # Resume click is not a vertex.
+            canvas.mouseMoveEvent(mouse(QtCore.QEvent.Type.MouseMove,
+                                        endpoint + QtCore.QPointF(-90, 80)))
+        else:
+            canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress,
+                                        endpoint + QtCore.QPointF(-90, 80),
+                                        QtCore.Qt.MouseButton.LeftButton,
+                                        QtCore.Qt.MouseButton.LeftButton))
+        assert len(pending.points) == len(before) + 1 and pending.points[:3] == before
+        # A missing release (outside the window) and loss of focus cannot leave
+        # middle-drag active or silently resume following.
+        if mode.startswith("brush"):
+            endpoint = projected(pending[-1])
+            canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress, endpoint,
+                                        QtCore.Qt.MouseButton.MiddleButton,
+                                        QtCore.Qt.MouseButton.MiddleButton))
+            canvas.mouseMoveEvent(mouse(QtCore.QEvent.Type.MouseMove, endpoint))
+            assert canvas._shared_boundary_middle_pan is None
+            canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress, endpoint,
+                                        QtCore.Qt.MouseButton.MiddleButton,
+                                        QtCore.Qt.MouseButton.MiddleButton))
+            canvas.focusOutEvent(QtGui.QFocusEvent(QtCore.QEvent.Type.FocusOut))
+            assert canvas._shared_boundary_middle_pan is None
+            canvas.mouseMoveEvent(mouse(QtCore.QEvent.Type.MouseMove,
+                                        endpoint + QtCore.QPointF(100, 100)))
+            assert len(pending.points) == 4
+        original_popup = widget.label_dialog.pop_up
+        widget.label_dialog.pop_up = lambda *a, **k: ("工程渣土", {}, None, "", False, [])
+        try:
+            QtTest.QTest.keyClick(canvas, QtCore.Qt.Key.Key_Return)
+        finally:
+            widget.label_dialog.pop_up = original_popup
+        assert canvas.current is None and len(canvas.shapes) == 2
+        output = image_path.with_suffix(".json")
+        assert widget.save_labels(str(output))
+        saved = next(s["points"] for s in json.loads(output.read_text(encoding="utf-8"))["shapes"]
+                     if s["label"] == "工程渣土")
+        assert saved == [[p.x(), p.y()] for p in pending.points]
+        widget.undo_shape_edit()
+        assert len(canvas.shapes) == 1 and canvas.shapes[0].points == old.points
+        print(f"middle pan: {mode}, four directions, safe resume, JSON and Undo passed")
+
+
 def quick_exec(app):
     # Fail safely if a regression unexpectedly opens an unattended modal dialog.
     watchdog = QtCore.QTimer(app)
@@ -381,6 +502,7 @@ def quick_exec(app):
             check_existing_priority(actions[0].parent())
             check_cancelled_drawing(actions[0].parent())
             check_brush_zoom(actions[0].parent())
+            check_middle_pan(actions[0].parent())
         if spacing_actions:
             widget = spacing_actions[0].parent()
             controller = widget._settings_controller
