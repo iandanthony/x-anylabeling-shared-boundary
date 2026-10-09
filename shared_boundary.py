@@ -1125,7 +1125,9 @@ def _resume_polygon_draft(widget, shape, points, undo_history, *, brush: bool) -
     widget.toggle_drawing_sensitive(True)
     canvas.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
     canvas.update()
-    method = "移动鼠标继续描边" if brush else "单击继续添加顶点"
+    canvas._shared_boundary_left_draft = None
+    canvas._shared_boundary_paused_draft = None
+    method = ("按住左键移动继续描边" if _hold_to_draw(canvas) else "移动鼠标继续描边") if brush else "单击继续添加顶点"
     widget.statusBar().showMessage(
         f"已取消类别填写，保留 {len(points)} 个顶点；{method}，Enter 完成；Esc 放弃草稿", 10000
     )
@@ -1137,6 +1139,22 @@ def _following_polygon(canvas) -> bool:
         and canvas.create_mode == "polygon"
         and canvas.current is not None
         and canvas._brush_drawing
+    )
+
+
+def _hold_to_draw(canvas) -> bool:
+    return getattr(canvas, "_shared_boundary_hold_to_draw", False)
+
+
+def _brush_input_settings():
+    """Keep extension preferences in the selected app profile, outside labels."""
+    from pathlib import Path
+    from PyQt6 import QtCore
+    from anylabeling.config import get_work_directory
+
+    return QtCore.QSettings(
+        str(Path(get_work_directory()) / ".shared-boundary.ini"),
+        QtCore.QSettings.Format.IniFormat,
     )
 
 
@@ -1165,6 +1183,12 @@ def _install_brush_navigation(widget_class) -> None:
             hint += QtCore.QSize(2 * padding[0], 2 * padding[1])
         return hint
 
+    def freeze_preview(canvas):
+        if canvas.current is not None and canvas.current.points:
+            canvas.line.points = [canvas.current[-1], canvas.current[-1]]
+            canvas.current.highlight_clear()
+            canvas.update()
+
     def mouse_move(self, event):
         position = QtCore.QPointF(event.globalPosition())
         self._shared_boundary_pointer_global = position
@@ -1188,6 +1212,8 @@ def _install_brush_navigation(widget_class) -> None:
             return
         if not _following_polygon(self):
             return original_move(self, event)
+        if _hold_to_draw(self) and not event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            self._shared_boundary_left_draft = None
         navigating = bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier)
         navigating = navigating or self._space_pressed or self._space_panning
         anchor = getattr(self, "_shared_boundary_navigation_global", None)
@@ -1206,6 +1232,16 @@ def _install_brush_navigation(widget_class) -> None:
             finally:
                 if self.current is draft and self.drawing():
                     self._brush_drawing = True
+                    if _hold_to_draw(self) and not event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+                        freeze_preview(self)
+        if _hold_to_draw(self) and (
+            not event.buttons() & QtCore.Qt.MouseButton.LeftButton
+            or getattr(self, "_shared_boundary_left_draft", None) is not self.current
+        ):
+            self._shared_boundary_left_draft = None
+            freeze_preview(self)
+            event.accept()
+            return
         self._shared_boundary_navigation_global = None
         return original_move(self, event)
 
@@ -1218,8 +1254,9 @@ def _install_brush_navigation(widget_class) -> None:
         canvas._shared_boundary_zoom_anchor = None
         canvas.restore_cursor()
         if paused(canvas):
+            resume = "按住左键移动继续描边" if _hold_to_draw(canvas) else "单击左键继续描边"
             canvas._shared_boundary_owner.statusBar().showMessage(
-                "描边已暂停；移回最后一个边界点附近，单击左键继续描边（中键仍可平移）", 10000
+                f"描边已暂停；移回最后一个边界点附近，{resume}（中键仍可平移）", 10000
             )
 
     def mouse_press(self, event):
@@ -1229,6 +1266,7 @@ def _install_brush_navigation(widget_class) -> None:
                 and self.drawing() and self.create_mode == "polygon"
                 and self.pixmap is not None and not self.pixmap.isNull()):
             if _following_polygon(self):
+                self._shared_boundary_left_draft = None
                 self._shared_boundary_paused_draft = self.current
                 # Freeze the preview at the last recorded vertex as well.
                 self.line.points = [self.current[-1], self.current[-1]]
@@ -1260,6 +1298,28 @@ def _install_brush_navigation(widget_class) -> None:
         if getattr(self, "_shared_boundary_middle_pan", None) is not None:
             event.accept()
             return
+        if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                and self.drawing() and self.create_mode == "polygon"
+                and self._brush_drawing and _hold_to_draw(self)):
+            if self._space_pressed or self._space_panning:
+                self._shared_boundary_left_draft = None
+                return original_press(self, event)
+            if event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+                event.accept()
+                return
+            if self.current is not None:
+                self._shared_boundary_paused_draft = None
+                self._shared_boundary_left_draft = self.current
+                self._shared_boundary_navigation_global = QtCore.QPointF(event.globalPosition())
+                freeze_preview(self)
+                owner.statusBar().showMessage("按住左键移动描边；松开暂停，Enter 完成", 5000)
+                # Resuming a stroke must not append a stray or duplicate point.
+                event.accept()
+                return
+            result = original_press(self, event)
+            if _following_polygon(self):
+                self._shared_boundary_left_draft = self.current
+            return result
         if paused(self) and event.button() == QtCore.Qt.MouseButton.LeftButton:
             self._shared_boundary_paused_draft = None
             self._shared_boundary_navigation_global = QtCore.QPointF(event.globalPosition())
@@ -1275,20 +1335,47 @@ def _install_brush_navigation(widget_class) -> None:
             stop_pan(self)
             event.accept()
             return
+        if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                and _following_polygon(self) and _hold_to_draw(self)):
+            self._shared_boundary_left_draft = None
+            freeze_preview(self)
+            if self._space_panning or self._space_pan_suppress_until_release:
+                return original_release(self, event)
+            self._shared_boundary_owner.statusBar().showMessage(
+                "描边已暂停；移回边界末端，按住左键移动继续；Enter 完成，中键拖动平移", 10000
+            )
+            event.accept()
+            return
         return original_release(self, event)
 
     def double_click(self, event):
+        if (_following_polygon(self) and _hold_to_draw(self)
+                and event.button() == QtCore.Qt.MouseButton.LeftButton
+                and getattr(self, "_shared_boundary_middle_pan", None) is None):
+            # Hold-mode presses do not add the duplicate point that the stock
+            # double-click handler removes. Keep the genuine final vertex.
+            if (not (self._space_pressed or self._space_panning
+                     or self._space_pan_suppress_until_release)
+                    and not event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier
+                    and self.double_click == "close" and self.can_close_shape()):
+                self.finalise()
+            event.accept()
+            return
         if paused(self) or getattr(self, "_shared_boundary_middle_pan", None) is not None:
             event.accept()
             return
         return original_double_click(self, event)
 
     def focus_out(self, event):
+        self._shared_boundary_left_draft = None
+        if _following_polygon(self) and _hold_to_draw(self):
+            freeze_preview(self)
         if getattr(self, "_shared_boundary_middle_pan", None) is not None:
             stop_pan(self)
         return original_focus_out(self, event)
 
     def reset(self, *args, **kwargs):
+        self._shared_boundary_left_draft = None
         self._shared_boundary_middle_pan = None
         self._shared_boundary_paused_draft = None
         return original_reset(self, *args, **kwargs)
@@ -1379,7 +1466,7 @@ def _install_brush_navigation(widget_class) -> None:
 
 def install() -> None:
     """Add shared-edge mode to the installed UI without replacing its files."""
-    from PyQt6 import QtGui, QtWidgets
+    from PyQt6 import QtCore, QtGui, QtWidgets
     from anylabeling.views.labeling.label_widget import LabelingWidget
 
     if getattr(LabelingWidget, "_shared_boundary_installed", False):
@@ -1435,6 +1522,34 @@ def install() -> None:
         )
         self.shared_boundary_point_spacing_action = point_spacing
         self.menus.edit.addAction(point_spacing)
+
+        hold_draw = QtGui.QAction("连续描边：按住左键才加点", self)
+        hold_draw.setCheckable(True)
+        hold_draw.setToolTip("默认开启：Ctrl+N 中按住左键移动才加点，松开暂停；取消勾选恢复随鼠标移动加点。设置自动保存")
+        self._shared_boundary_input_settings = _brush_input_settings()
+        hold_draw.setChecked(self._shared_boundary_input_settings.value("brush/hold_left_button", True, type=bool))
+        self.canvas._shared_boundary_hold_to_draw = hold_draw.isChecked()
+        self.canvas._shared_boundary_left_draft = None
+
+        def set_hold_draw(enabled):
+            self.canvas._shared_boundary_hold_to_draw = enabled
+            self.canvas._shared_boundary_left_draft = None
+            self.canvas._shared_boundary_paused_draft = None
+            if _following_polygon(self.canvas):
+                self.canvas.line.points = [self.canvas.current[-1], self.canvas.current[-1]]
+                self.canvas.update()
+            settings = self._shared_boundary_input_settings
+            settings.setValue("brush/hold_left_button", enabled)
+            settings.sync()
+            message = "连续描边：按住左键移动才加点，松开暂停" if enabled else "连续描边：随鼠标移动加点"
+            if settings.status() != QtCore.QSettings.Status.NoError:
+                LOG.warning("Failed to save brush input preference: %s", settings.fileName())
+                message += "；本次已生效，但设置未能保存"
+            self.statusBar().showMessage(message, 10000)
+
+        hold_draw.toggled.connect(set_hold_draw)
+        self.shared_boundary_hold_draw_action = hold_draw
+        self.menus.edit.addAction(hold_draw)
 
         reconcile = QtGui.QAction("以画布选中图形为准裁剪其他类别", self)
         reconcile.setToolTip("选中多边形向外扩展后，再次从其他类别中扣除重叠部分")
@@ -1550,6 +1665,7 @@ def install() -> None:
         original_undo(self)
 
     def load_file_with_shared_boundary(self, *args, **kwargs):
+        self.canvas._shared_boundary_left_draft = None
         self.canvas._shared_boundary_middle_pan = None
         self.canvas._shared_boundary_paused_draft = None
         self.canvas._shared_boundary_zoom_padding = None

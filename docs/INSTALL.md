@@ -1,6 +1,6 @@
 # Windows 新手安装教程：从下载到第一次保存标注
 
-**适用：共边扩展 1.0.4 / X-AnyLabeling 4.0.6；Windows 10 / 11，Intel 或 AMD 的 x64 电脑，Python 3.12 64 位。**
+**适用：共边扩展 1.0.5 / X-AnyLabeling 4.0.6；Windows 10 / 11，Intel 或 AMD 的 x64 电脑，Python 3.12 64 位。**
 
 主流程采用 **下载 ZIP → 安装专用 Python 环境 → 启动验收 → 桌面快捷方式**，不要求学习 Git 或 Conda，也不要求登录 GitHub。日常安装完成后可双击桌面入口。
 
@@ -353,6 +353,7 @@ PowerShell 使用完整解释器路径时，以引号和 `&` 调用：
 | 源码 | 用户目录 `Apps\x-anylabeling-shared-boundary-main` |
 | CPU / GPU 专用依赖 | 程序目录 `.venv` / 可选 `.venv-gpu` |
 | 日常配置 | 用户目录 `X-AnyLabeling-SharedBoundary\.xanylabelingrc` |
+| 连续描边左键开关 | 工作目录 `.shared-boundary.ini`；菜单切换后自动保存 |
 | 自动下载模型 | 工作目录 `xanylabeling_data\models`；自定义配置可指向别处 |
 | 标注 JSON | 通常与图片同目录，或软件指定的输出目录 |
 
@@ -393,7 +394,7 @@ git pull --ff-only
 
 ### 迁移到新电脑
 
-带走图片、JSON、所需配置和缓存模型；在新电脑重装 Python 和依赖。重新核对绝对模型路径和快捷方式。虚拟环境绑定创建它时的 Python 与位置，不直接搬运。
+带走图片、JSON、所需配置和缓存模型；保留描边开关时一并复制工作目录中的 `.shared-boundary.ini`。在新电脑重装 Python 和依赖。重新核对绝对模型路径和快捷方式。虚拟环境绑定创建它时的 Python 与位置，不直接搬运。
 
 ### 可选脚本安装
 

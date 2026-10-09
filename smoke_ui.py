@@ -388,11 +388,15 @@ def check_middle_pan(widget):
             canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress, endpoint,
                                         QtCore.Qt.MouseButton.LeftButton,
                                         QtCore.Qt.MouseButton.LeftButton))
-            canvas.mouseReleaseEvent(mouse(QtCore.QEvent.Type.MouseButtonRelease, endpoint,
-                                          QtCore.Qt.MouseButton.LeftButton))
+            if not canvas._shared_boundary_hold_to_draw:
+                canvas.mouseReleaseEvent(mouse(QtCore.QEvent.Type.MouseButtonRelease, endpoint,
+                                              QtCore.Qt.MouseButton.LeftButton))
             assert pending.points == before  # Resume click is not a vertex.
             canvas.mouseMoveEvent(mouse(QtCore.QEvent.Type.MouseMove,
-                                        endpoint + QtCore.QPointF(-90, 80)))
+                                        endpoint + QtCore.QPointF(-90, 80),
+                                        buttons=(QtCore.Qt.MouseButton.LeftButton
+                                                 if canvas._shared_boundary_hold_to_draw
+                                                 else QtCore.Qt.MouseButton.NoButton)))
         else:
             canvas.mousePressEvent(mouse(QtCore.QEvent.Type.MouseButtonPress,
                                         endpoint + QtCore.QPointF(-90, 80),
@@ -431,6 +435,134 @@ def check_middle_pan(widget):
         widget.undo_shape_edit()
         assert len(canvas.shapes) == 1 and canvas.shapes[0].points == old.points
         print(f"middle pan: {mode}, four directions, safe resume, JSON and Undo passed")
+
+
+def check_hold_draw(widget):
+    """Exercise real held strokes, navigation, cancellation and preferences."""
+    from PyQt6 import QtTest
+    from anylabeling.views.labeling.shape import Shape
+    from shared_boundary import _brush_input_settings
+
+    action = widget.shared_boundary_hold_draw_action
+    assert action.isChecked() and widget.canvas._shared_boundary_hold_to_draw
+    action.setChecked(False)
+    assert not _brush_input_settings().value("brush/hold_left_button", True, type=bool)
+    action.setChecked(True)
+    assert _brush_input_settings().value("brush/hold_left_button", False, type=bool)
+    assert Path(widget._shared_boundary_input_settings.fileName()).is_file()
+
+    image_path = Path(test_work.name) / "held-strokes.png"
+    image = QtGui.QImage(1000, 900, QtGui.QImage.Format.Format_RGB32)
+    image.fill(QtCore.Qt.GlobalColor.white)
+    assert image.save(str(image_path))
+    widget.load_file(str(image_path))
+    widget.set_fit_window()
+    QtWidgets.QApplication.processEvents()
+    old = Shape(label="装修垃圾", shape_type="polygon")
+    old.points = [QtCore.QPointF(x, y) for x, y in ((0, 0), (100, 0), (100, 100), (0, 100))]
+    old.close()
+    widget.load_shapes([old])
+    widget.toggle_brush_polygon_mode()
+    canvas = widget.canvas
+
+    def event(kind, point, button=QtCore.Qt.MouseButton.NoButton,
+              buttons=QtCore.Qt.MouseButton.NoButton):
+        local = (point + canvas.offset_to_center()) * canvas.scale
+        global_position = QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint())) + local
+        return QtGui.QMouseEvent(kind, local, global_position, button, buttons,
+                                QtCore.Qt.KeyboardModifier.NoModifier)
+
+    def press(point):
+        canvas.mousePressEvent(event(QtCore.QEvent.Type.MouseButtonPress, point,
+                                    QtCore.Qt.MouseButton.LeftButton,
+                                    QtCore.Qt.MouseButton.LeftButton))
+
+    def move(point, held=False):
+        canvas.mouseMoveEvent(event(QtCore.QEvent.Type.MouseMove, point,
+                                   buttons=QtCore.Qt.MouseButton.LeftButton if held
+                                   else QtCore.Qt.MouseButton.NoButton))
+
+    start = QtCore.QPointF(350, 250)
+    press(start)
+    pending = canvas.current
+    assert pending is not None and pending.points == [start]
+    move(QtCore.QPointF(700, 250), True)
+    move(QtCore.QPointF(700, 500), True)
+    before = list(pending.points)
+    assert len(before) == 3
+    canvas.mouseReleaseEvent(event(QtCore.QEvent.Type.MouseButtonRelease, before[-1],
+                                  QtCore.Qt.MouseButton.LeftButton))
+    for point in (QtCore.QPointF(800, 700), start, before[-1]):
+        move(point)
+        assert canvas.current is pending and pending.points == before
+        assert canvas.line.points == [before[-1], before[-1]]
+    # A stray held-button event after a lost release cannot start another stroke.
+    move(QtCore.QPointF(850, 700), True)
+    assert pending.points == before
+    # Wheel navigation while released cannot append a vertex or close the shape.
+    local = (before[-1] + canvas.offset_to_center()) * canvas.scale
+    global_position = QtCore.QPointF(canvas.mapToGlobal(QtCore.QPoint())) + local
+    canvas.wheelEvent(QtGui.QWheelEvent(
+        local, global_position, QtCore.QPoint(), QtCore.QPoint(0, -120),
+        QtCore.Qt.MouseButton.NoButton, QtCore.Qt.KeyboardModifier.ControlModifier,
+        QtCore.Qt.ScrollPhase.NoScrollPhase, False))
+    QtWidgets.QApplication.processEvents()
+    move(start)
+    assert canvas.current is pending and pending.points == before
+    press(before[-1])
+    assert pending.points == before  # Press to resume does not add a duplicate.
+    canvas.focusOutEvent(QtGui.QFocusEvent(QtCore.QEvent.Type.FocusOut))
+    move(QtCore.QPointF(550, 650), True)
+    assert pending.points == before
+    press(before[-1])
+    move(QtCore.QPointF(550, 650), True)
+    assert len(pending.points) == 4 and pending.points[:3] == before
+    kept = list(pending.points)
+
+    # A held-mode double click has no spurious press-added vertex to remove.
+    # Closing the real label dialog must preserve every genuine draft vertex.
+    QtCore.QTimer.singleShot(20, widget.label_dialog.close)
+    canvas.mouseDoubleClickEvent(event(QtCore.QEvent.Type.MouseButtonDblClick, kept[-1],
+                                      QtCore.Qt.MouseButton.LeftButton,
+                                      QtCore.Qt.MouseButton.LeftButton))
+    assert canvas.current is pending and pending.points == kept
+    assert canvas._shared_boundary_left_draft is None
+    move(start)
+    move(QtCore.QPointF(250, 650), True)
+    assert canvas.current is pending and pending.points == kept
+    press(kept[-1])
+    move(QtCore.QPointF(250, 650), True)
+    assert len(pending.points) == 5
+    # The switch takes effect immediately and preserves existing coordinates.
+    action.setChecked(False)
+    move(QtCore.QPointF(250, 500))
+    assert len(pending.points) == 6
+    action.setChecked(True)
+    move(start)
+    assert canvas.current is pending and len(pending.points) == 6
+
+    original_popup = widget.label_dialog.pop_up
+    widget.label_dialog.pop_up = lambda *a, **k: ("工程渣土", {}, None, "", False, [])
+    try:
+        QtTest.QTest.keyClick(canvas, QtCore.Qt.Key.Key_Return)
+    finally:
+        widget.label_dialog.pop_up = original_popup
+    assert canvas.current is None and len(canvas.shapes) == 2
+    assert widget.save_labels(str(image_path.with_suffix(".json")))
+    saved = json.loads(image_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert next(s["points"] for s in saved["shapes"] if s["label"] == "工程渣土") == [
+        [p.x(), p.y()] for p in pending.points]
+    widget.undo_shape_edit()
+    assert len(canvas.shapes) == 1 and canvas.shapes[0].points == old.points
+    widget.toggle_draw_mode(False, create_mode="polygon")
+    widget.toggle_brush_polygon_mode()
+    press(start)
+    new_draft = canvas.current
+    move(QtCore.QPointF(700, 250), True)
+    assert len(new_draft.points) == 2
+    QtTest.QTest.keyClick(canvas, QtCore.Qt.Key.Key_Escape)
+    assert canvas.current is None and len(canvas.shapes) == 1
+    print("held strokes: release protection, repeated strokes, zoom, focus, dialog, settings, JSON, Undo and Esc passed")
 
 
 def quick_exec(app):
@@ -499,10 +631,17 @@ def quick_exec(app):
         print("polygon selection action and button:", len(box_actions), len(box_buttons))
         print("same class deduction button:", len(same_buttons))
         if actions:
-            check_existing_priority(actions[0].parent())
-            check_cancelled_drawing(actions[0].parent())
-            check_brush_zoom(actions[0].parent())
-            check_middle_pan(actions[0].parent())
+            widget = actions[0].parent()
+            assert widget.shared_boundary_hold_draw_action.isChecked()
+            # Keep legacy regression cases, then verify the new default mode.
+            widget.shared_boundary_hold_draw_action.setChecked(False)
+            check_existing_priority(widget)
+            check_cancelled_drawing(widget)
+            check_brush_zoom(widget)
+            check_middle_pan(widget)
+            widget.shared_boundary_hold_draw_action.setChecked(True)
+            check_hold_draw(widget)
+            check_middle_pan(widget)
         if spacing_actions:
             widget = spacing_actions[0].parent()
             controller = widget._settings_controller

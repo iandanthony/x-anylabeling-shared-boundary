@@ -8,6 +8,7 @@ venv/
 .env.*
 !.env.example
 .xanylabelingrc
+.shared-boundary.ini
 .test-work/
 *.onnx
 *.pt
